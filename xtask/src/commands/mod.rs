@@ -1,6 +1,7 @@
 pub mod compat;
 pub mod lint;
 pub mod release;
+pub mod scorecard;
 pub mod setup;
 pub mod test;
 

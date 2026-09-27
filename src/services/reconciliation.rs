@@ -471,6 +471,10 @@ impl crate::services::scheduler::Job for ReconciliationJob {
 }
 
 impl ReconciliationJob {
+    /// `reconciliation.run` is timed by `telemetry::latency_budget` as one
+    /// run of the periodic reconciliation stage; it is only entered once
+    /// leadership is settled, so skipped cycles are not counted as runs.
+    #[tracing::instrument(name = "reconciliation.run", skip(self))]
     async fn run_reconciliation(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Truncate to the UTC day boundary so that if this does run
         // concurrently on more than one instance (leader election disabled,

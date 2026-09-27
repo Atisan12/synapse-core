@@ -40,6 +40,12 @@ enum Commands {
     /// Render or check the SDK/CLI/API compatibility matrix
     /// (COMPATIBILITY.toml -> docs/compatibility-matrix.md).
     CompatMatrix(commands::compat::CompatMatrixArgs),
+
+    /// Compare production reliability metrics before vs after a release and
+    /// flag statistically meaningful regressions (docs/release-scorecard.md).
+    ///
+    /// Requires: curl, PROMETHEUS_URL
+    Scorecard(commands::scorecard::ScorecardArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,5 +57,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Lint(args) => commands::lint::run(args),
         Commands::Release(args) => commands::release::run(args),
         Commands::CompatMatrix(args) => commands::compat::run(args),
+        Commands::Scorecard(args) => commands::scorecard::run(args),
     }
 }

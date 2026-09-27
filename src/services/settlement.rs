@@ -168,6 +168,7 @@ impl SettlementService {
     /// Respects each asset's `settlement_schedule` — assets configured as
     /// "hourly" are always eligible; "daily" assets only settle once per day;
     /// "weekly" assets only settle on Mondays.
+    #[tracing::instrument(name = "settlement.run", skip(self))]
     pub async fn run_settlements(&self) -> Result<Vec<Settlement>, AppError> {
         let start = std::time::Instant::now();
 

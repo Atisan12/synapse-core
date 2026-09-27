@@ -80,12 +80,14 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer().json())
+                .with(synapse_core::telemetry::latency_budget::layer())
                 .init();
         }
         config::LogFormat::Text => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer())
+                .with(synapse_core::telemetry::latency_budget::layer())
                 .init();
         }
     }
@@ -296,6 +298,34 @@ async fn serve(
         .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {e}"))?;
     tracing::info!("Metrics initialized successfully");
     metrics::spawn_pool_metrics_task(pool.clone(), 30);
+
+    // Tokio task leak detection (telemetry::task_leak): per-category live
+    // task / load gauges, plus a monitor that alerts on task growth the load
+    // doesn't explain.
+    let _task_leak_gauges = metrics::register_task_leak_gauges();
+    tokio::spawn(synapse_core::telemetry::task_leak::run_leak_monitor(
+        std::sync::Arc::clone(synapse_core::telemetry::task_leak::global()),
+        synapse_core::telemetry::task_leak::LeakDetectorConfig::from_env(),
+        std::time::Duration::from_secs(
+            std::env::var("TASK_LEAK_SAMPLE_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        ),
+    ));
+
+    // End-to-end latency budget (telemetry::latency_budget): stage samples
+    // come from the tracing layer installed above; evaluate them per window.
+    let _latency_budget_gauges = metrics::register_latency_budget_gauges();
+    tokio::spawn(synapse_core::telemetry::latency_budget::run_evaluator(
+        std::sync::Arc::clone(synapse_core::telemetry::latency_budget::global()),
+        std::time::Duration::from_secs(
+            std::env::var("LATENCY_BUDGET_EVAL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+        ),
+    ));
 
     // Initialize rate limiting
     tracing::info!(

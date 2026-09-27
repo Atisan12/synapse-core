@@ -1,3 +1,4 @@
+pub mod alerting;
 pub mod auth;
 pub mod cache;
 pub mod config;
