@@ -2,6 +2,7 @@ pub mod account_monitor;
 pub mod analyze_monitor;
 pub mod backup;
 pub mod backup_verification_job;
+pub mod canary_controller;
 pub mod blue_green;
 pub mod circuit_breaker;
 pub mod circuit_breaker_coordinator;
@@ -32,6 +33,7 @@ pub use account_monitor::AccountMonitor;
 pub use backup::BackupService;
 pub use backup_verification_job::BackupVerificationJob;
 pub use blue_green::{BlueGreenState, BlueGreenController, Slot as BlueGreenSlot};
+pub use canary_controller::{CanaryController, CanaryDimension, CanaryRelease, CanaryUpdate};
 pub use circuit_breaker_coordinator::{
     CircuitBreakerCoordinator, CircuitBreakerState, CircuitState, CoordinatorError,
 };
