@@ -199,3 +199,8 @@ See the [open issues](https://github.com/synapse-bridgez/synapse-core/issues) fo
 
 📄 License
 This project is licensed under the MIT License. See the LICENSE file for details.
+
+## Handsoff notes
+
+<!-- handsoff-issue-1338 -->
+- #1338: [High] Embed runbook links in alert payloads automatically
