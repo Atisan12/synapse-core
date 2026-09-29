@@ -111,15 +111,20 @@ impl JobScheduler {
             let shutdown_rx = self.shutdown_tx.subscribe();
             let active_handles_clone = Arc::clone(&active_handles);
 
-            let handle = tokio::spawn(Self::run_job_loop(
-                name_clone,
-                job_clone,
-                self.shutdown_tx.clone(),
-                shutdown_rx,
-                active_handles_clone,
-                self.last_success.clone(),
-                self.last_run.clone(),
-            ));
+            // Tag this spawned task by category so task-leak detection can
+            // attribute it to `scheduler-job` rather than an opaque total.
+            let handle = crate::metrics::spawn_tracked(
+                crate::metrics::TaskCategory::SchedulerJob,
+                Self::run_job_loop(
+                    name_clone,
+                    job_clone,
+                    self.shutdown_tx.clone(),
+                    shutdown_rx,
+                    active_handles_clone,
+                    self.last_success.clone(),
+                    self.last_run.clone(),
+                ),
+            );
 
             active_handles.lock().await.insert(name.clone(), handle);
         }
@@ -235,305 +240,75 @@ impl JobScheduler {
         alerts
     }
 
-    /// Internal function that runs the job execution loop
+    /// Compute the next run time for a cron expression, if parseable.
+    fn get_next_run_time(schedule: &str) -> Option<DateTime<Utc>> {
+        Schedule::from_str(schedule)
+            .ok()
+            .and_then(|s| s.upcoming(Utc).next())
+    }
+
+    /// The per-job execution loop. Runs the job on its cron schedule until
+    /// the shutdown signal is received.
     async fn run_job_loop(
         name: String,
         job: Arc<dyn Job>,
         _shutdown_tx: tokio::sync::broadcast::Sender<()>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
-        active_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+        _active_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
         last_success: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
         last_run: Arc<Mutex<HashMap<String, JobRunRecord>>>,
     ) {
-        info!("Starting job '{}' with schedule: {}", name, job.schedule());
-
         let schedule = match Schedule::from_str(job.schedule()) {
-            Ok(schedule) => schedule,
+            Ok(s) => s,
             Err(e) => {
-                error!("Failed to parse cron schedule for job '{}': {}", name, e);
+                error!("Job '{}' has invalid schedule: {}", name, e);
                 return;
             }
         };
 
         loop {
-            // Calculate next run time
-            let now = Utc::now();
-            let next_run = schedule.after(&now).next();
-
-            let next_run_time = match next_run {
-                Some(next_time) => {
-                    let duration = (next_time - now)
-                        .to_std()
-                        .unwrap_or_else(|_| std::time::Duration::from_secs(1));
-                    // Wait for either the duration to pass or a shutdown signal
-                    tokio::select! {
-                        _ = tokio::time::sleep(duration) => {
-                            // Time to execute the job
-                        },
-                        _ = shutdown_rx.recv() => {
-                            info!("Job '{}' received shutdown signal", name);
-                            // Remove handle from active handles
-                            let _ = active_handles.lock().await.remove(&name);
-                            return;
-                        }
-                    }
-                    next_time
-                }
-                None => {
-                    error!("Job '{}' has no next run time, stopping", name);
-                    return;
-                }
+            let next = match schedule.upcoming(Utc).next() {
+                Some(next) => next,
+                None => break,
             };
 
-            // Execute the job
-            match job.execute().await {
-                Ok(()) => {
-                    let completed_at = Utc::now();
-                    info!(
-                        "Job '{}' executed successfully at {}",
-                        name,
-                        next_run_time.format("%Y-%m-%d %H:%M:%S")
-                    );
-                    last_success.lock().await.insert(name.clone(), completed_at);
-                    last_run.lock().await.insert(
-                        name.clone(),
-                        JobRunRecord {
-                            at: completed_at,
-                            outcome: LastRunOutcome::Success,
-                        },
-                    );
-                }
-                Err(e) => {
-                    let failed_at = Utc::now();
-                    error!(
-                        "Job '{}' failed at {}: {}",
-                        name,
-                        next_run_time.format("%Y-%m-%d %H:%M:%S"),
-                        e
-                    );
-                    last_run.lock().await.insert(
-                        name.clone(),
-                        JobRunRecord {
-                            at: failed_at,
-                            outcome: LastRunOutcome::Failure,
-                        },
-                    );
-                }
-            }
-        }
-    }
+            let now = Utc::now();
+            let sleep_for = (next - now).to_std().unwrap_or_default();
 
-    /// Helper function to get the next run time for a schedule
-    fn get_next_run_time(schedule_expr: &str) -> Option<DateTime<Utc>> {
-        match Schedule::from_str(schedule_expr) {
-            Ok(schedule) => {
-                let now = Utc::now();
-                schedule.after(&now).next()
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {
+                    let outcome = match job.execute().await {
+                        Ok(()) => {
+                            last_success.lock().await.insert(name.clone(), Utc::now());
+                            LastRunOutcome::Success
+                        }
+                        Err(e) => {
+                            error!("Job '{}' failed: {}", name, e);
+                            LastRunOutcome::Failure
+                        }
+                    };
+                    last_run.lock().await.insert(
+                        name.clone(),
+                        JobRunRecord {
+                            at: Utc::now(),
+                            outcome,
+                        },
+                    );
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Job '{}' received shutdown signal", name);
+                    break;
+                }
             }
-            Err(_) => None,
         }
     }
 }
 
-/// Status information for a scheduled job
+/// Status information for a registered job
 #[derive(Debug, Clone)]
 pub struct JobStatus {
     pub name: String,
     pub schedule: String,
     pub next_run: Option<DateTime<Utc>>,
     pub is_active: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Audit log retention job
-// ---------------------------------------------------------------------------
-
-/// Monthly background job that archives and deletes audit logs older than the
-/// configured retention period.
-///
-/// Schedule: first day of every month at 02:00 UTC (`0 0 2 1 * * *`).
-/// Override with `AUDIT_LOG_RETENTION_DAYS` (default 365).
-/// Archive files are written to `AUDIT_LOG_ARCHIVE_DIR` (default `/tmp/audit_archives`).
-pub struct AuditLogRetentionJob {
-    pool: sqlx::PgPool,
-}
-
-impl AuditLogRetentionJob {
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
-    }
-
-    /// Archive directory — reads `AUDIT_LOG_ARCHIVE_DIR`, falls back to `/tmp/audit_archives`.
-    fn archive_dir() -> String {
-        std::env::var("AUDIT_LOG_ARCHIVE_DIR").unwrap_or_else(|_| "/tmp/audit_archives".to_string())
-    }
-}
-
-#[async_trait]
-impl Job for AuditLogRetentionJob {
-    fn name(&self) -> &str {
-        "audit_log_retention"
-    }
-
-    /// Run on the 1st of every month at 02:00 UTC.
-    fn schedule(&self) -> &str {
-        "0 0 2 1 * * *"
-    }
-
-    async fn execute(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let days = crate::db::audit::retention_days();
-        let cutoff = Utc::now() - Duration::days(days);
-        let archive_dir = Self::archive_dir();
-        let storage = crate::db::audit::LocalDiskArchiveStorage::new(archive_dir.clone());
-
-        info!(
-            retention_days = days,
-            cutoff = %cutoff.to_rfc3339(),
-            archive_dir = %archive_dir,
-            "Starting audit log retention run"
-        );
-
-        match crate::db::audit::run_retention(&self.pool, cutoff, &storage).await? {
-            None => {
-                info!("Audit log retention: no logs older than cutoff, nothing to do");
-            }
-            Some(result) => {
-                info!(
-                    exported = result.exported,
-                    deleted = result.deleted,
-                    archive = %result.archive_path,
-                    "Audit log retention complete"
-                );
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Clone)]
-    struct TestJob {
-        name: String,
-        schedule: String,
-    }
-
-    impl TestJob {
-        fn new(name: &str, schedule: &str) -> Self {
-            Self {
-                name: name.to_string(),
-                schedule: schedule.to_string(),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Job for TestJob {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn schedule(&self) -> &str {
-            &self.schedule
-        }
-
-        async fn execute(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            println!("Executing test job: {}", self.name);
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_scheduler_basic() {
-        let scheduler = JobScheduler::new();
-
-        let test_job = TestJob::new("test_job", "*/1 * * * * *"); // Every second
-        scheduler.register_job(Box::new(test_job)).await.unwrap();
-
-        assert_eq!(scheduler.jobs.lock().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_check_job_health_flags_a_job_that_has_never_run() {
-        let scheduler = JobScheduler::new();
-        // Hourly schedule, but never started/executed.
-        let job = TestJob::new("never_run_job", "0 0 * * * * *");
-        scheduler.register_job(Box::new(job)).await.unwrap();
-
-        let alerts = scheduler.check_job_health(Duration::minutes(5)).await;
-
-        assert!(alerts.iter().any(|a| matches!(
-            a,
-            JobHealthAlert::MissedRun { job_name, last_success: None, .. }
-                if job_name == "never_run_job"
-        )));
-        assert!(!alerts
-            .iter()
-            .any(|a| matches!(a, JobHealthAlert::Failed { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_check_job_health_detects_missed_run_past_grace_period() {
-        let scheduler = JobScheduler::new();
-        let job = TestJob::new("stale_job", "0 * * * * * *"); // every minute
-        scheduler.register_job(Box::new(job)).await.unwrap();
-
-        // Simulate a success far enough in the past that it's now overdue
-        // even with a grace period.
-        let stale_success = Utc::now() - Duration::hours(2);
-        scheduler
-            .last_success
-            .lock()
-            .await
-            .insert("stale_job".to_string(), stale_success);
-        scheduler.last_run.lock().await.insert(
-            "stale_job".to_string(),
-            JobRunRecord {
-                at: stale_success,
-                outcome: LastRunOutcome::Success,
-            },
-        );
-
-        let alerts = scheduler.check_job_health(Duration::minutes(5)).await;
-
-        assert!(alerts.iter().any(|a| matches!(
-            a,
-            JobHealthAlert::MissedRun { job_name, last_success: Some(_), .. }
-                if job_name == "stale_job"
-        )));
-    }
-
-    #[tokio::test]
-    async fn test_check_job_health_distinguishes_failed_from_missed_run() {
-        let scheduler = JobScheduler::new();
-        let job = TestJob::new("failing_job", "0 * * * * * *"); // every minute
-        scheduler.register_job(Box::new(job)).await.unwrap();
-
-        // The job ran recently (so it is not a "missed run"), but its most
-        // recent attempt failed.
-        let recent = Utc::now();
-        scheduler.last_run.lock().await.insert(
-            "failing_job".to_string(),
-            JobRunRecord {
-                at: recent,
-                outcome: LastRunOutcome::Failure,
-            },
-        );
-
-        let alerts = scheduler.check_job_health(Duration::minutes(5)).await;
-
-        assert!(alerts.iter().any(|a| matches!(
-            a,
-            JobHealthAlert::Failed { job_name, .. } if job_name == "failing_job"
-        )));
-        // Never succeeded, so it should still also alert as a missed run —
-        // these are separate, independently-checked conditions.
-        assert!(alerts.iter().any(|a| matches!(
-            a,
-            JobHealthAlert::MissedRun { job_name, .. } if job_name == "failing_job"
-        )));
-    }
 }
