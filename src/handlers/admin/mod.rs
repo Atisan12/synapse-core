@@ -6,6 +6,7 @@ pub mod locks;
 pub mod quota;
 pub mod reconciliation;
 pub mod rules_preview;
+pub mod tenant_secret;
 pub mod transaction_notes;
 pub mod webhook_endpoints;
 pub mod webhook_filter_rules;
@@ -522,8 +523,14 @@ mod tests {
     #[test]
     fn test_admin_endpoint_access_control_matrix_defined() {
         let matrix = admin_endpoint_matrix();
-        assert!(!matrix.is_empty(), "Access control matrix must not be empty");
-        assert!(matrix.len() >= 11, "Matrix should cover all documented endpoints");
+        assert!(
+            !matrix.is_empty(),
+            "Access control matrix must not be empty"
+        );
+        assert!(
+            matrix.len() >= 11,
+            "Matrix should cover all documented endpoints"
+        );
     }
 
     #[test]

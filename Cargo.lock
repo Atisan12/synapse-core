@@ -4938,7 +4938,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -6514,7 +6514,10 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
