@@ -1,4 +1,5 @@
 pub mod account_monitor;
+pub mod analyze_monitor;
 pub mod backup;
 pub mod backup_verification_job;
 pub mod circuit_breaker;
@@ -15,6 +16,7 @@ pub mod rate_cache;
 pub mod rate_cache_refresh_job;
 pub mod reconciliation;
 pub mod resource_limits;
+pub mod retention_policy;
 pub mod scheduler;
 pub mod settlement;
 pub mod settlement_sla;
