@@ -202,6 +202,8 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 ## Handsoff notes
 
+<!-- handsoff-issue-1356 -->
+- #1356: [High] Add an audit-log tailing command to the CLI
 <!-- handsoff-issue-1345 -->
 - #1345: [High] Add SDK request/response logging with secret redaction
 <!-- handsoff-issue-1341 -->
