@@ -4,9 +4,13 @@ pub mod compliance;
 pub mod locks;
 pub mod quota;
 pub mod reconciliation;
+pub mod rules_preview;
+pub mod transaction_notes;
 pub mod webhook_endpoints;
 pub mod webhook_filter_rules;
+pub mod webhook_redirects;
 pub mod webhook_replay;
+pub mod webhook_retry_policy;
 
 use crate::error::AppError;
 use crate::validation::{validate_max_len, validate_required};
