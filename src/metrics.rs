@@ -31,6 +31,22 @@
 //! | `admin_compliance_report_requests_total` | Counter | Requests to the compliance report endpoints, labeled by operation (newly mounted) |
 //! | `readiness_initialization_duration_ms` | Histogram | Time spent in `run_initialization_checks`, labeled by outcome (ready/failed) |
 //! | `settlement_transactions_total`   | Counter    | Transactions settled via settle_asset, labeled by asset_code |
+//! | `redis_degraded_operations_total` | Counter | Redis failures degraded around, labeled by component and fallback (see `cache::degradation`) |
+//! | `secrets_cached_fallback_used_total` | Counter | Verifications served from the last-known-good secret during a Vault outage |
+//! | `secrets_stale_rejected_total` | Counter | Verifications refused because the cached secret passed its max fallback age |
+//! | `vault_refresh_failures_total` | Counter | Failed Vault secret refreshes, labeled by secret |
+//! | `vault_secret_staleness_seconds` | Gauge | Seconds since each secret's last successful Vault refresh |
+//! | `vault_fallback_active` | Gauge | 1 while any secret is served from the Vault fallback cache |
+//! | `dependency_scorecard_*` | Gauge | Rolling 7/30/90-day dependency uptime / error rate / p95 (see `services::dependency_scorecard`) |
+//! | `tenant_request_latency_window_*` | Gauge | Per-tenant rolling-window latency histograms, top-K tenants only (see `tenant::latency`) |
+//! | `admin_compliance_report_requests_total` | Counter | Requests to the compliance report endpoints, labeled by operation (newly mounted) |
+//! | `readiness_initialization_duration_ms` | Histogram | Time spent in `run_initialization_checks`, labeled by outcome (ready/failed) |
+//! | `settlement_transactions_total`   | Counter    | Transactions settled via settle_asset, labeled by asset_code |
+//! | `tokio_tasks_live` / `tokio_tasks_load` | Gauge | Live tagged tokio tasks and the load explaining them, by category (task leak detection) |
+//! | `tokio_runtime_alive_tasks`       | Gauge      | All alive tasks on the runtime (tagged or not) |
+//! | `tokio_task_leak_suspected_total` | Counter    | Load-uncorrelated task growth detections, by category |
+//! | `pipeline_stage_latency_ms`       | Histogram  | Latency attributed to each pipeline stage (latency budget) |
+//! | `pipeline_stage_
 //! | `tokio_tasks_live` / `tokio_tasks_load` | Gauge | Live tagged tokio tasks and the load explaining them, by category (task leak detection) |
 //! | `tokio_runtime_alive_tasks`       | Gauge      | All alive tasks on the runtime (tagged or not) |
 //! | `tokio_task_leak_suspected_total` | Counter    | Load-uncorrelated task growth detections, by category |
@@ -618,6 +634,20 @@ pub fn admin_compliance_report_requests_total() -> Counter<u64> {
         .init()
 }
 
+ounter("admin_audit_search_requests_total")
+        .with_description("Requests to the admin audit-log search endpoint")
+        .init()
+}
+
+/// Requests to the compliance report endpoints, labeled by `operation`
+/// ("generate" | "list").
+pub fn admin_compliance_report_requests_total() -> Counter<u64> {
+    meter()
+        .u64_counter("admin_compliance_report_requests_total")
+        .with_description("Requests to the admin compliance report endpoints, labeled by operation")
+        .init()
+}
+
 /// Replication lag measurement histogram (milliseconds), labeled by `replica`.
 /// A value of -1 indicates the replica is unreachable.
 pub fn replica_lag_ms() -> Histogram<f64> {
@@ -669,6 +699,16 @@ pub fn table_bloat_size_mb() -> Histogram<f64> {
         .init()
 }
 
+/// Registers the observable gauges for tokio task leak detection
+/// (`src/telemetry/task_leak.rs`): `tokio_tasks_live{category}` and
+/// `tokio_tasks_load{category}` from the tagged-spawn registry, plus
+/// `tokio_runtime_alive_tasks` from tokio's own runtime metrics, which also
+/// counts untagged tasks. Call once at startup from inside the runtime and
+/// keep the returned gauges alive.
+pub fn register_task_leak_gauges() -> Vec<ObservableGauge<u64>> {
+    use crate::telemetry::task_leak;
+
+ 
 /// Registers the observable gauges for tokio task leak detection
 /// (`src/telemetry/task_leak.rs`): `tokio_tasks_live{category}` and
 /// `tokio_tasks_load{category}` from the tagged-spawn registry, plus
@@ -792,6 +832,65 @@ pub fn register_latency_budget_gauges() -> Vec<ObservableGauge<f64>> {
 
     vec![p95, budget, utilization]
 }
+
+/// Redis failures a component degraded around instead of failing the
+/// request, labeled by `component` and `fallback` (both closed sets — see
+/// `cache::degradation`). Every Redis-dependent path emits this identically,
+/// so `sum by (component)` during an outage is its full blast radius.
+pub fn redis_degraded_operations_total() -> Counter<u64> {
+    meter()
+        .u64_counter("redis_degraded_operations_total")
+        .with_description(
+            "Redis failures degraded around (not failed), labeled by component and fallback",
+        )
+        .init()
+}
+
+/// Verifications served from a cached (last-known-good) secret while Vault
+/// is unreachable, labeled by `secret`. Nonzero means the bounded Vault
+/// fallback is live — never a silent state.
+pub fn secrets_cached_fallback_used_total() -> Counter<u64> {
+    meter()
+        .u64_counter("secrets_cached_fallback_used_total")
+        .with_description(
+            "Secret verifications served from the last-known-good cache while Vault is \
+             unreachable, labeled by secret",
+        )
+        .init()
+}
+
+/// Verifications refused because the cached secret outlived
+/// `VAULT_SECRET_FALLBACK_MAX_AGE_SECS` during a Vault outage (or the secret
+/// is not approved for caching), labeled by `secret`.
+pub fn secrets_stale_rejected_total() -> Counter<u64> {
+    meter()
+        .u64_counter("secrets_stale_rejected_total")
+        .with_description(
+            "Secret verifications refused because the cached secret exceeded its maximum \
+             fallback age during a Vault outage, labeled by secret",
+        )
+        .init()
+}
+
+/// Failed Vault secret refresh attempts, labeled by `secret`.
+pub fn vault_refresh_failures_total() -> Counter<u64> {
+    meter()
+        .u64_counter("vault_refresh_failures_total")
+        .with_description("Failed Vault secret refresh attempts, labeled by secret")
+        .init()
+}
+
+// ---------------------------------------------------------------------------
+// Provider initialisation
+// ---------------------------------------------------------------------------
+
+/// Initialise the global OTel metrics provider and return it so the caller
+/// can keep it alive for the process lifetime.
+///
+/// Call this once at startup, before any instruments are used.
+pub fn init_metrics_provider() -> Result<SdkMeterProvider, Box<dyn std::error::Error>> {
+    let endpoint =
+        st
 }
 
 // ---------------------------------------------------------------------------
