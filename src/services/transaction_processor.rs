@@ -1,9 +1,7 @@
 use crate::services::query_cache::QueryCache;
 use crate::services::webhook_dispatcher::WebhookDispatcher;
 use sqlx::PgPool;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 /// Overall end-to-end SLA target for the webhook-to-reconciliation pipeline.
 pub const END_TO_END_SLA_TARGET: Duration = Duration::from_secs(30);
@@ -386,7 +384,11 @@ impl TransactionProcessor {
     #[instrument(
         name = "processor.process_transaction",
         skip(self),
-        fields(transaction.id = %tx_id, trace_id = tracing::field::Empty)
+        fields(
+            transaction.id = %tx_id,
+            trace_id = tracing::field::Empty,
+            pipeline.queue_wait_ms = tracing::field::Empty
+        )
     )]
     pub async fn process_transaction(&self, tx_id: uuid::Uuid) -> anyhow::Result<()> {
         // Fetch the transaction first
@@ -405,11 +407,16 @@ impl TransactionProcessor {
             tracing::Span::current().record("trace_id", &trace_id.as_str());
         }
 
-        // Derive per-stage latency from the existing trace spans rather than
-        // adding bespoke timers: the pipeline stages below are already
-        // instrumented, so we collect their observed durations into spans and
-        // report them against the per-stage budget.
-        let mut stage_spans: Vec<StageSpan> = Vec::new();
+        // Time the transaction sat pending between ingestion and now; the
+        // latency-budget layer (telemetry::latency_budget) charges it to the
+        // processing stage.
+        let queue_wait_ms = (chrono::Utc::now() - tx.created_at)
+            .num_milliseconds()
+            .max(0);
+        tracing::Span::current().record(
+            crate::telemetry::latency_budget::QUEUE_WAIT_FIELD,
+            queue_wait_ms,
+        );
 
         // Define the pipeline stages
         let mut stages: Vec<Box<dyn ProcessingStage>> = Vec::new();
@@ -453,21 +460,40 @@ impl TransactionProcessor {
         // Execute the pipeline, attributing each stage's observed duration to
         // its latency-budget stage.
         for stage in stages {
-            let started = Instant::now();
-            let result = stage.execute(&tx).await;
-            let elapsed = started.elapsed();
+            let stage_name = stage.name();
+            let start = std::time::Instant::now();
+            tracing::info!("Starting {} stage for transaction {}", stage_name, tx_id);
 
-            let latency_stage = match stage.name() {
-                "validate" => LatencyStage::Validation,
-                "enrich" | "verify" | "complete" => LatencyStage::Processing,
-                _ => LatencyStage::Processing,
+            // Span names feed telemetry::latency_budget: the validate stage
+            // counts toward the validation budget, the rest toward processing.
+            let stage_span = if stage_name == "validate" {
+                tracing::info_span!("processor.stage.validate")
+            } else {
+                tracing::info_span!("processor.stage", stage = stage_name)
             };
-            stage_spans.push(StageSpan {
-                stage: latency_stage,
-                duration: elapsed,
-            });
-
-            result?;
+            match stage.execute(&tx).instrument(stage_span).await {
+                Ok(()) => {
+                    let duration = start.elapsed();
+                    tracing::info!(
+                        "{} stage completed in {:?} for transaction {}",
+                        stage_name,
+                        duration,
+                        tx_id
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "{} stage failed for transaction {}: {}",
+                        stage_name,
+                        tx_id,
+                        e
+                    );
+                    // Move to DLQ on failure
+                    self.move_to_dlq(tx_id, &format!("{stage_name} stage failed: {e}"))
+                        .await?;
+                    return Err(e);
+                }
+            }
         }
 
         // Report actual per-stage latency against budget and alert when a

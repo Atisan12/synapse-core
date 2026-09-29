@@ -56,6 +56,41 @@ pub enum JobHealthAlert {
     },
 }
 
+impl JobHealthAlert {
+    /// The alert payload for this condition, carrying its runbook link
+    /// (see `crate::alerting`).
+    pub fn to_alert(&self) -> crate::alerting::AlertPayload {
+        use crate::alerting::{names, AlertPayload, AlertSeverity};
+        match self {
+            JobHealthAlert::MissedRun {
+                job_name,
+                last_success,
+                expected_by,
+            } => AlertPayload::new(
+                names::SCHEDULED_JOB_MISSED_RUN,
+                AlertSeverity::Warning,
+                format!("scheduled job '{job_name}' has not completed since it was due"),
+            )
+            .with_label("job_name", job_name)
+            .with_label(
+                "last_success",
+                last_success.map_or_else(|| "never".to_string(), |t| t.to_rfc3339()),
+            )
+            .with_label("expected_by", expected_by.to_rfc3339()),
+            JobHealthAlert::Failed {
+                job_name,
+                failed_at,
+            } => AlertPayload::new(
+                names::SCHEDULED_JOB_FAILED,
+                AlertSeverity::Warning,
+                format!("scheduled job '{job_name}' failed on its last run"),
+            )
+            .with_label("job_name", job_name)
+            .with_label("failed_at", failed_at.to_rfc3339()),
+        }
+    }
+}
+
 /// A job scheduler that manages cron-based recurring tasks
 pub struct JobScheduler {
     jobs: Arc<Mutex<HashMap<String, Arc<dyn Job>>>>,
@@ -104,6 +139,12 @@ impl JobScheduler {
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let jobs = self.jobs.lock().await;
         let active_handles = self.active_handles.clone();
+        // Each registered job owns exactly one loop task (see
+        // telemetry::task_leak::TaskCategory::tasks_per_load).
+        crate::telemetry::task_leak::global().set_load(
+            crate::telemetry::task_leak::TaskCategory::SchedulerJob,
+            jobs.len() as u64,
+        );
 
         for (name, job) in jobs.iter() {
             let job_clone = Arc::clone(job);
@@ -111,10 +152,8 @@ impl JobScheduler {
             let shutdown_rx = self.shutdown_tx.subscribe();
             let active_handles_clone = Arc::clone(&active_handles);
 
-            // Tag this spawned task by category so task-leak detection can
-            // attribute it to `scheduler-job` rather than an opaque total.
-            let handle = crate::metrics::spawn_tracked(
-                crate::metrics::TaskCategory::SchedulerJob,
+            let handle = crate::telemetry::task_leak::spawn_tracked(
+                crate::telemetry::task_leak::TaskCategory::SchedulerJob,
                 Self::run_job_loop(
                     name_clone,
                     job_clone,
@@ -311,4 +350,227 @@ pub struct JobStatus {
     pub schedule: String,
     pub next_run: Option<DateTime<Utc>>,
     pub is_active: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Audit log retention job
+// ---------------------------------------------------------------------------
+
+/// Monthly background job that archives and deletes audit logs older than the
+/// configured retention period.
+///
+/// Schedule: first day of every month at 02:00 UTC (`0 0 2 1 * * *`).
+/// Override with `AUDIT_LOG_RETENTION_DAYS` (default 365).
+/// Archive files are written to `AUDIT_LOG_ARCHIVE_DIR` (default `/tmp/audit_archives`).
+pub struct AuditLogRetentionJob {
+    pool: sqlx::PgPool,
+}
+
+impl AuditLogRetentionJob {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Archive directory — reads `AUDIT_LOG_ARCHIVE_DIR`, falls back to `/tmp/audit_archives`.
+    fn archive_dir() -> String {
+        std::env::var("AUDIT_LOG_ARCHIVE_DIR").unwrap_or_else(|_| "/tmp/audit_archives".to_string())
+    }
+}
+
+#[async_trait]
+impl Job for AuditLogRetentionJob {
+    fn name(&self) -> &str {
+        "audit_log_retention"
+    }
+
+    /// Run on the 1st of every month at 02:00 UTC.
+    fn schedule(&self) -> &str {
+        "0 0 2 1 * * *"
+    }
+
+    async fn execute(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let days = crate::db::audit::retention_days();
+        let cutoff = Utc::now() - Duration::days(days);
+        let archive_dir = Self::archive_dir();
+        let storage = crate::db::audit::LocalDiskArchiveStorage::new(archive_dir.clone());
+
+        info!(
+            retention_days = days,
+            cutoff = %cutoff.to_rfc3339(),
+            archive_dir = %archive_dir,
+            "Starting audit log retention run"
+        );
+
+        match crate::db::audit::run_retention(&self.pool, cutoff, &storage).await? {
+            None => {
+                info!("Audit log retention: no logs older than cutoff, nothing to do");
+            }
+            Some(result) => {
+                info!(
+                    exported = result.exported,
+                    deleted = result.deleted,
+                    archive = %result.archive_path,
+                    "Audit log retention complete"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestJob {
+        name: String,
+        schedule: String,
+    }
+
+    impl TestJob {
+        fn new(name: &str, schedule: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                schedule: schedule.to_string(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Job for TestJob {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn schedule(&self) -> &str {
+            &self.schedule
+        }
+
+        async fn execute(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            println!("Executing test job: {}", self.name);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_basic() {
+        let scheduler = JobScheduler::new();
+
+        let test_job = TestJob::new("test_job", "*/1 * * * * *"); // Every second
+        scheduler.register_job(Box::new(test_job)).await.unwrap();
+
+        assert_eq!(scheduler.jobs.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_job_health_flags_a_job_that_has_never_run() {
+        let scheduler = JobScheduler::new();
+        // Hourly schedule, but never started/executed.
+        let job = TestJob::new("never_run_job", "0 0 * * * * *");
+        scheduler.register_job(Box::new(job)).await.unwrap();
+
+        let alerts = scheduler.check_job_health(Duration::minutes(5)).await;
+
+        assert!(alerts.iter().any(|a| matches!(
+            a,
+            JobHealthAlert::MissedRun { job_name, last_success: None, .. }
+                if job_name == "never_run_job"
+        )));
+        assert!(!alerts
+            .iter()
+            .any(|a| matches!(a, JobHealthAlert::Failed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_check_job_health_detects_missed_run_past_grace_period() {
+        let scheduler = JobScheduler::new();
+        let job = TestJob::new("stale_job", "0 * * * * * *"); // every minute
+        scheduler.register_job(Box::new(job)).await.unwrap();
+
+        // Simulate a success far enough in the past that it's now overdue
+        // even with a grace period.
+        let stale_success = Utc::now() - Duration::hours(2);
+        scheduler
+            .last_success
+            .lock()
+            .await
+            .insert("stale_job".to_string(), stale_success);
+        scheduler.last_run.lock().await.insert(
+            "stale_job".to_string(),
+            JobRunRecord {
+                at: stale_success,
+                outcome: LastRunOutcome::Success,
+            },
+        );
+
+        let alerts = scheduler.check_job_health(Duration::minutes(5)).await;
+
+        assert!(alerts.iter().any(|a| matches!(
+            a,
+            JobHealthAlert::MissedRun { job_name, last_success: Some(_), .. }
+                if job_name == "stale_job"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_check_job_health_distinguishes_failed_from_missed_run() {
+        let scheduler = JobScheduler::new();
+        let job = TestJob::new("failing_job", "0 * * * * * *"); // every minute
+        scheduler.register_job(Box::new(job)).await.unwrap();
+
+        // The job ran recently (so it is not a "missed run"), but its most
+        // recent attempt failed.
+        let recent = Utc::now();
+        scheduler.last_run.lock().await.insert(
+            "failing_job".to_string(),
+            JobRunRecord {
+                at: recent,
+                outcome: LastRunOutcome::Failure,
+            },
+        );
+
+        let alerts = scheduler.check_job_health(Duration::minutes(5)).await;
+
+        assert!(alerts.iter().any(|a| matches!(
+            a,
+            JobHealthAlert::Failed { job_name, .. } if job_name == "failing_job"
+        )));
+        // Never succeeded, so it should still also alert as a missed run —
+        // these are separate, independently-checked conditions.
+        assert!(alerts.iter().any(|a| matches!(
+            a,
+            JobHealthAlert::MissedRun { job_name, .. } if job_name == "failing_job"
+        )));
+    }
+
+    #[test]
+    fn job_health_alerts_carry_runbook_links() {
+        let missed = JobHealthAlert::MissedRun {
+            job_name: "daily_reconciliation".into(),
+            last_success: None,
+            expected_by: Utc::now(),
+        }
+        .to_alert();
+        assert_eq!(
+            missed.alert,
+            crate::alerting::names::SCHEDULED_JOB_MISSED_RUN
+        );
+        assert_eq!(missed.labels["last_success"], "never");
+        assert!(missed
+            .runbook_url
+            .as_deref()
+            .unwrap()
+            .ends_with("#scheduled-job-health-alerts"));
+
+        let failed = JobHealthAlert::Failed {
+            job_name: "daily_reconciliation".into(),
+            failed_at: Utc::now(),
+        }
+        .to_alert();
+        assert_eq!(failed.alert, crate::alerting::names::SCHEDULED_JOB_FAILED);
+        assert_eq!(failed.labels["job_name"], "daily_reconciliation");
+        assert!(failed.runbook_url.is_some());
+    }
 }
