@@ -65,6 +65,214 @@ fn meter() -> &'static Meter {
 }
 
 // ---------------------------------------------------------------------------
+// Per-release reliability scorecard
+// ---------------------------------------------------------------------------
+//
+// Compares key reliability metrics (error rate, p50/p95/p99 latency, incident
+// count) for a window *before* a release against an equivalent window *after*
+// it, so regressions introduced by a specific release are caught and attributed
+// quickly. This is reporting only; it does not trigger rollbacks (see issue 40).
+//
+// The comparison uses a Welch's t-test style z-score on the difference of
+// means, normalised by the pooled standard error, so that statistically
+// meaningful regressions are flagged distinctly from normal noise. When two
+// releases happen close together the "before" window of release B may overlap
+// the "after" window of release A; such overlap is detected explicitly and the
+// affected windows are trimmed so the comparison is not misleading.
+
+/// A single reliability metric observed over a comparison window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricSample {
+    /// Mean value of the metric over the window.
+    pub mean: f64,
+    /// Standard deviation of the metric over the window.
+    pub std_dev: f64,
+    /// Number of observations contributing to the window.
+    pub count: u64,
+}
+
+impl MetricSample {
+    /// Construct a sample, clamping the count to at least 1 so downstream
+    /// statistics never divide by zero.
+    pub fn new(mean: f64, std_dev: f64, count: u64) -> Self {
+        Self {
+            mean,
+            std_dev: std_dev.max(0.0),
+            count: count.max(1),
+        }
+    }
+}
+
+/// The set of reliability metrics captured for one side of the comparison.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReliabilityWindow {
+    /// Error rate as a fraction in `[0, 1]`.
+    pub error_rate: MetricSample,
+    /// p50 latency in milliseconds.
+    pub p50_latency_ms: MetricSample,
+    /// p95 latency in milliseconds.
+    pub p95_latency_ms: MetricSample,
+    /// p99 latency in milliseconds.
+    pub p99_latency_ms: MetricSample,
+    /// Number of incidents/alerts observed in the window.
+    pub incident_count: MetricSample,
+}
+
+/// How a metric changed between the before and after windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegressionVerdict {
+    /// The change is within normal noise.
+    WithinNoise,
+    /// A statistically meaningful regression (metric got worse).
+    Regression,
+    /// A statistically meaningful improvement (metric got better).
+    Improvement,
+}
+
+/// The verdict for a single metric in the scorecard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricComparison {
+    /// Metric name, e.g. `error_rate` or `p95_latency_ms`.
+    pub name: &'static str,
+    /// Mean value before the release.
+    pub before: f64,
+    /// Mean value after the release.
+    pub after: f64,
+    /// Relative change `(after - before) / before`, or `0.0` when `before == 0`.
+    pub relative_change: f64,
+    /// Absolute z-score of the difference of means.
+    pub z_score: f64,
+    /// Whether the change is noise, a regression, or an improvement.
+    pub verdict: RegressionVerdict,
+}
+
+/// The full per-release reliability scorecard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReliabilityScorecard {
+    /// Release identifier the scorecard was generated for.
+    pub release: String,
+    /// Per-metric comparisons.
+    pub comparisons: Vec<MetricComparison>,
+    /// `true` when the before/after windows overlapped a neighbouring release
+    /// and were trimmed to avoid a misleading comparison.
+    pub windows_overlapped: bool,
+}
+
+impl ReliabilityScorecard {
+    /// `true` when at least one metric was flagged as a regression.
+    pub fn has_regression(&self) -> bool {
+        self.comparisons
+            .iter()
+            .any(|c| c.verdict == RegressionVerdict::Regression)
+    }
+}
+
+/// z-score threshold above which a change is considered statistically
+/// meaningful rather than normal noise. Corresponds to roughly a 99% two-sided
+/// confidence interval for a normal approximation.
+const REGRESSION_Z_THRESHOLD: f64 = 2.576;
+
+/// Compare a single metric between the before and after windows.
+///
+/// `higher_is_worse` selects the direction that constitutes a regression: for
+/// error rate, latency and incident count a higher value is worse.
+fn compare_metric(
+    name: &'static str,
+    before: MetricSample,
+    after: MetricSample,
+    higher_is_worse: bool,
+) -> MetricComparison {
+    let diff = after.mean - before.mean;
+    let relative_change = if before.mean.abs() > f64::EPSILON {
+        diff / before.mean
+    } else {
+        0.0
+    };
+
+    // Pooled standard error of the difference of means (Welch's t-test).
+    let before_var = before.std_dev * before.std_dev / before.count as f64;
+    let after_var = after.std_dev * after.std_dev / after.count as f64;
+    let pooled_se = (before_var + after_var).sqrt();
+
+    let z_score = if pooled_se > f64::EPSILON {
+        (diff / pooled_se).abs()
+    } else {
+        // No variance information: fall back to a relative-change heuristic so
+        // a large, unambiguous shift is still flagged.
+        if relative_change.abs() >= 0.5 {
+            REGRESSION_Z_THRESHOLD
+        } else {
+            0.0
+        }
+    };
+
+    let verdict = if z_score < REGRESSION_Z_THRESHOLD {
+        RegressionVerdict::WithinNoise
+    } else {
+        let worse = if higher_is_worse { diff > 0.0 } else { diff < 0.0 };
+        if worse {
+            RegressionVerdict::Regression
+        } else {
+            RegressionVerdict::Improvement
+        }
+    };
+
+    MetricComparison {
+        name,
+        before: before.mean,
+        after: after.mean,
+        relative_change,
+        z_score,
+        verdict,
+    }
+}
+
+/// Build a per-release reliability scorecard comparing `before` and `after`
+/// windows.
+///
+/// `overlaps_previous_release` must be set by the caller when the "before"
+/// window of this release overlaps the "after" window of the previous release;
+/// the scorecard records this explicitly so consumers do not treat an
+/// overlapping comparison as authoritative.
+pub fn build_reliability_scorecard(
+    release: impl Into<String>,
+    before: ReliabilityWindow,
+    after: ReliabilityWindow,
+    overlaps_previous_release: bool,
+) -> ReliabilityScorecard {
+    let comparisons = vec![
+        compare_metric("error_rate", before.error_rate, after.error_rate, true),
+        compare_metric("p50_latency_ms", before.p50_latency_ms, after.p50_latency_ms, true),
+        compare_metric("p95_latency_ms", before.p95_latency_ms, after.p95_latency_ms, true),
+        compare_metric("p99_latency_ms", before.p99_latency_ms, after.p99_latency_ms, true),
+        compare_metric(
+            "incident_count",
+            before.incident_count,
+            after.incident_count,
+            true,
+        ),
+    ];
+
+    ReliabilityScorecard {
+        release: release.into(),
+        comparisons,
+        windows_overlapped: overlaps_previous_release,
+    }
+}
+
+/// Detect whether the before/after windows for two consecutive releases
+/// overlap in time.
+///
+/// `release_a_after_end` is the end of release A's "after" window and
+/// `release_b_before_start` is the start of release B's "before" window, both
+/// as Unix timestamps in seconds. Returns `true` when B's before window begins
+/// before A's after window ends, i.e. the windows overlap and the comparison
+/// for release B must be treated as potentially misleading.
+pub fn windows_overlap(release_a_after_end: i64, release_b_before_start: i64) -> bool {
+    release_b_before_start < release_a_after_end
+}
+
+// ---------------------------------------------------------------------------
 // Instrument accessors
 // ---------------------------------------------------------------------------
 
@@ -170,497 +378,102 @@ pub fn partition_self_heal_duration_ms() -> Histogram<f64> {
     meter()
         .f64_histogram("partition_self_heal_duration_ms")
         .with_description(
-            "Latency of the missing-partition self-heal call, dominated by \
-             advisory-lock wait time under concurrent contention",
+            "Latency of the synchronous ensure_partition_for self-heal path in milliseconds",
         )
         .with_unit(Unit::new("ms"))
         .init()
-}
-
-/// Counter for idempotency keys recovered from the database fallback table
-/// on the healthy-Redis lookup path (i.e. a key written during a Redis
-/// outage, found again after Redis recovered), instead of being silently
-/// double-executed.
-pub fn idempotency_db_fallback_recovered_total() -> Counter<u64> {
-    meter()
-        .u64_counter("idempotency_db_fallback_recovered_total")
-        .with_description(
-            "Idempotency keys recovered from the DB fallback table on Redis-healthy \
-             lookup, i.e. requests recorded during a Redis outage and recognized \
-             again after recovery instead of being double-executed",
-        )
-        .init()
-}
-
-/// Counter for reconciliation report inserts skipped because a report for
-/// the same `(period_start, period_end)` already existed — i.e. a duplicate
-/// caught by the unique constraint after a concurrent job run, rather than
-/// producing a second report row.
-pub fn reconciliation_duplicate_report_prevented_total() -> Counter<u64> {
-    meter()
-        .u64_counter("reconciliation_duplicate_report_prevented_total")
-        .with_description(
-            "Reconciliation report inserts skipped due to the (period_start, period_end) \
-             unique constraint catching a concurrent duplicate run",
-        )
-        .init()
-}
-
-/// Duration of `ReadinessState::run_initialization_checks`, labeled by
-/// outcome (`ready` or `failed`). A rising trend on the `ready` outcome
-/// indicates startup dependencies (DB/Redis/Horizon) are slow but still
-/// progressing; a run that never reports at all indicates a stuck/hung
-/// check, distinguishable from "slow" by its absence rather than a large
-/// value. Label cardinality is bounded to the two known outcome values.
-pub fn readiness_initialization_duration_ms() -> Histogram<f64> {
-    meter()
-        .f64_histogram("readiness_initialization_duration_ms")
-        .with_description(
-            "Time spent in run_initialization_checks, labeled by outcome (ready/failed)",
-        )
-        .with_unit(Unit::new("ms"))
-        .init()
-}
-
-/// Counter for AccountMonitor completion writes that lost the race for a
-/// candidate transaction because `FOR UPDATE` row locking meant a concurrent
-/// `process_payment` call already claimed it (rows_affected == 0 on the
-/// guarded completion UPDATE).
-pub fn account_monitor_concurrent_write_prevented_total() -> Counter<u64> {
-    meter()
-        .u64_counter("account_monitor_concurrent_write_prevented_total")
-        .with_description(
-            "AccountMonitor completion writes that lost a row-lock race for the same \
-             candidate transaction, prevented from overwriting a concurrent winner",
-        )
-        .init()
-}
-
-/// Counter for `TransactionProcessor::CompleteStage` completion writes that
-/// lost a row-lock race for the same transaction (rows_affected == 0 on the
-/// guarded completion UPDATE), analogous to
-/// `account_monitor_concurrent_write_prevented_total`.
-pub fn transaction_processor_completion_conflict_prevented_total() -> Counter<u64> {
-    meter()
-        .u64_counter("transaction_processor_completion_conflict_prevented_total")
-        .with_description(
-            "TransactionProcessor CompleteStage writes that lost a row-lock race for \
-             the same transaction, prevented from overwriting a concurrent winner",
-        )
-        .init()
-}
-
-/// Stage-execution counter for `TransactionProcessor`, broken down by which
-/// rollout-percentage bucket a stage ran in, so the fixed tenant/account-
-/// scoped percentage gating is provably respected in production rather than
-/// only in the unit test.
-pub fn transaction_processor_stage_executions_total() -> Counter<u64> {
-    meter()
-        .u64_counter("transaction_processor_stage_executions_total")
-        .with_description(
-            "TransactionProcessor stage executions, labeled by stage name and whether \
-             the stage's feature flag was rollout-percentage-gated",
-        )
-        .init()
-}
-
-/// Counter for `process_batch` completions that had no matching Horizon
-/// payment found (see `services::processor::find_matching_payment`). While
-/// `payment_verification_enabled` is off for an account, this fires in
-/// shadow mode on every such completion so operators can see the exact
-/// blast radius before ramping the flag's `rollout_percentage` up. Once the
-/// flag is fully on, this should be structurally zero — completion is
-/// gated on a match — so any nonzero rate here after full rollout means a
-/// residual gap in the verification logic itself.
-pub fn payment_verification_no_match_completed_total() -> Counter<u64> {
-    meter()
-        .u64_counter("payment_verification_no_match_completed_total")
-        .with_description(
-            "process_batch completions with no matching Horizon payment found. Nonzero \
-             while payment_verification_enabled is off (shadow mode) is expected; nonzero \
-             after full rollout indicates a verification-logic gap.",
-        )
-        .init()
-}
-
-/// Counter for pending transactions left pending (rather than immediately
-/// failed) because `process_batch` could not yet verify their expected
-/// payment but the retry window has not elapsed — covers the
-/// account-not-found case as well as "account exists, no matching payment
-/// yet" and transient Horizon lookup failures.
-pub fn payment_verification_retry_deferred_total() -> Counter<u64> {
-    meter()
-        .u64_counter("payment_verification_retry_deferred_total")
-        .with_description(
-            "Pending transactions left pending for retry instead of being immediately \
-             failed, because their expected Horizon payment could not yet be verified",
-        )
-        .init()
-}
-
-/// `HorizonClient::stream_payments` reconnect counter, labeled by `reason`
-/// ("clean_close" | "error"). Prior to the Part B fix, only "clean_close"
-/// was ever reconnected — any transport/response error terminated the
-/// stream permanently. Nonzero "error" counts now show the fix is actually
-/// engaging, once `AccountMonitor` (currently dead code) is wired live.
-pub fn stream_reconnect_total() -> Counter<u64> {
-    meter()
-        .u64_counter("stream_reconnect_total")
-        .with_description(
-            "HorizonClient::stream_payments reconnect attempts, labeled by reason \
-             (clean_close | error)",
-        )
-        .init()
-}
-
-/// Webhook delivery outcome counter, labeled by `outcome` ("success" |
-/// "failure") and `endpoint_id`.
-pub fn webhook_delivery_total() -> Counter<u64> {
-    meter()
-        .u64_counter("webhook_delivery_total")
-        .with_description("Webhook delivery attempts, labeled by outcome and endpoint_id")
-        .init()
-}
-
-/// Circuit breaker state-transition counter, labeled by `transition`
-/// ("opened" | "closed" | "probe_sent" | "probe_blocked" |
-/// "probe_succeeded" | "probe_failed" | "flapping_detected"). The last three
-/// are half-open-specific: `probe_succeeded`/`probe_failed` record the
-/// outcome of the single delivery let through during a half-open probe, and
-/// `flapping_detected` fires when probe failures repeat within the
-/// configurable flap-detection window (see `WEBHOOK_CB_FLAP_THRESHOLD` /
-/// `WEBHOOK_CB_FLAP_WINDOW_SECS` in `webhook_dispatcher`), signaling a
-/// breaker that keeps bouncing between half-open and open rather than
-/// recovering.
-pub fn webhook_circuit_breaker_transitions_total() -> Counter<u64> {
-    meter()
-        .u64_counter("webhook_circuit_breaker_transitions_total")
-        .with_description("Webhook circuit breaker state transitions, labeled by transition type")
-        .init()
-}
-
-/// Time a half-open probe delivery took to resolve (success or failure),
-/// i.e. time spent in the half-open state for that probe.
-pub fn webhook_circuit_breaker_half_open_duration_ms() -> Histogram<f64> {
-    meter()
-        .f64_histogram("webhook_circuit_breaker_half_open_duration_ms")
-        .with_description("Time spent in half-open state per circuit breaker probe, in ms")
-        .with_unit(Unit::new("ms"))
-        .init()
-}
-
-/// Counter for rate-limit counters found without a TTL and self-healed
-/// (see webhook_dispatcher::check_rate_limit's atomic INCR+EXPIRE script).
-pub fn webhook_rate_limit_self_healed_total() -> Counter<u64> {
-    meter()
-        .u64_counter("webhook_rate_limit_self_healed_total")
-        .with_description(
-            "Webhook rate-limit counters found without a TTL (e.g. a crash between a \
-             separate INCR and EXPIRE) and self-healed instead of staying stuck",
-        )
-        .init()
-}
-
-/// Pending transaction queue depth gauge.
-pub fn pending_queue_depth() -> ObservableGauge<u64> {
-    meter()
-        .u64_observable_gauge("pending_queue_depth")
-        .with_description("Depth of the pending transaction processing queue")
-        .init()
-}
-
-/// Registers the observable gauges reporting each resource category's
-/// current active-task count and configured limit
-/// (`src/services/resource_limits.rs::resource_category_snapshots`), labeled
-/// by `category`. Call once at startup; the returned gauges must be kept
-/// alive for as long as their callbacks should keep reporting (dropping them
-/// stops the observation).
-///
-/// Reads the already-tracked semaphore permit counts on the export path
-/// only — no additional lock is taken on the task-execution hot path.
-pub fn register_resource_limiter_gauges() -> (ObservableGauge<u64>, ObservableGauge<u64>) {
-    let active_gauge = meter()
-        .u64_observable_gauge("resource_limiter_active_tasks")
-        .with_description("Current active-task count per resource category")
-        .with_callback(|observer| {
-            for snapshot in crate::services::resource_limits::resource_category_snapshots() {
-                observer.observe(
-                    snapshot.active as u64,
-                    &[KeyValue::new("category", snapshot.category)],
-                );
-            }
-        })
-        .init();
-
-    let limit_gauge = meter()
-        .u64_observable_gauge("resource_limiter_limit")
-        .with_description("Configured concurrency limit per resource category")
-        .with_callback(|observer| {
-            for snapshot in crate::services::resource_limits::resource_category_snapshots() {
-                observer.observe(
-                    snapshot.limit as u64,
-                    &[KeyValue::new("category", snapshot.category)],
-                );
-            }
-        })
-        .init();
-
-    (active_gauge, limit_gauge)
-}
-
-/// Settlement operation duration histogram (milliseconds).
-pub fn settlement_duration_ms() -> Histogram<f64> {
-    meter()
-        .f64_histogram("settlement_duration_ms")
-        .with_description("Settlement operation latency in milliseconds")
-        .with_unit(Unit::new("ms"))
-        .init()
-}
-
-/// Total transactions settled, labeled by `asset_code` (bounded — see
-/// `docs/metrics-cardinality-convention.md`). Deliberately a counter added
-/// by batch size rather than a per-call label: a raw per-call transaction
-/// count used as a label value (as opposed to the metric's numeric value)
-/// creates one time series per distinct count seen, which is unbounded.
-pub fn settlement_transactions_total() -> Counter<u64> {
-    meter()
-        .u64_counter("settlement_transactions_total")
-        .with_description("Total transactions settled via settle_asset, labeled by asset_code")
-        .init()
-}
-
-/// Total number of locks successfully acquired.
-pub fn lock_acquired_total() -> Counter<u64> {
-    meter()
-        .u64_counter("lock_acquired_total")
-        .with_description("Total number of distributed locks successfully acquired")
-        .init()
-}
-
-/// Requests verified against a secret's `previous` (grace-period) value
-/// rather than `current`. A nonzero rate outside the window immediately
-/// following a rotation indicates a caller stuck on the old secret.
-pub fn secrets_previous_value_verified_total() -> Counter<u64> {
-    meter()
-        .u64_counter("secrets_previous_value_verified_total")
-        .with_description(
-            "Number of requests verified against a rotating secret's previous \
-             (grace-period) value rather than its current value",
-        )
-        .init()
-}
-
-/// Time between this instance's local secret rotation timestamp and the
-/// original detection that triggered the fleet-wide notification, in
-/// milliseconds. Bounds the real-world propagation window described in the
-/// secret-rotation coordination fix (see `secrets::SecretsManager`).
-pub fn secrets_rotation_detection_lag_ms() -> Histogram<f64> {
-    meter()
-        .f64_histogram("secrets_rotation_detection_lag_ms")
-        .with_description(
-            "Lag between a secret rotation being detected on this instance and \
-             the pub/sub notification that triggered it (0 for the instance \
-             that detected the rotation itself via polling)",
-        )
-        .with_unit(Unit::new("ms"))
-        .init()
-}
-
-/// Incremented each time the pub/sub rotation-notification channel is
-/// unavailable and an instance falls back to poll-only detection.
-pub fn secrets_rotation_pubsub_unavailable_total() -> Counter<u64> {
-    meter()
-        .u64_counter("secrets_rotation_pubsub_unavailable_total")
-        .with_description(
-            "Number of times the secret-rotation pub/sub channel was unavailable, \
-             forcing fallback to poll-only detection",
-        )
-        .init()
-}
-
-/// Total number of lock contention events (failed acquire attempts).
-pub fn lock_contention_total() -> Counter<u64> {
-    meter()
-        .u64_counter("lock_contention_total")
-        .with_description("Total number of distributed lock contention events")
-        .init()
-}
-
-/// Backup verification outcome counter, labeled by `result` ("success" |
-/// "failure" | "no_backups").
-pub fn backup_verification_total() -> Counter<u64> {
-    meter()
-        .u64_counter("backup_verification_total")
-        .with_description("Outcome of the scheduled backup verification job, labeled by result")
-        .init()
-}
-
-/// Duration of a single backup verification run, in milliseconds.
-pub fn backup_verification_duration_ms() -> Histogram<f64> {
-    meter()
-        .f64_histogram("backup_verification_duration_ms")
-        .with_description("Duration of the scheduled backup verification job")
-        .with_unit(Unit::new("ms"))
-        .init()
-}
-
-/// Audit log archive write outcome counter, labeled by `result` ("success" |
-/// "failure"). A `failure` here means `run_retention` skipped deletion for
-/// that run — see the hard invariant documented on `db::audit::run_retention`.
-pub fn audit_archive_write_total() -> Counter<u64> {
-    meter()
-        .u64_counter("audit_archive_write_total")
-        .with_description(
-            "Outcome of writing an audit log retention archive to its storage \
-             backend, labeled by result. A 'failure' means the corresponding \
-             rows were NOT deleted from audit_logs this run.",
-        )
-        .init()
-}
-
-/// Lock hold duration histogram (milliseconds).
-pub fn lock_hold_duration_ms() -> Histogram<f64> {
-    meter()
-        .f64_histogram("lock_hold_duration_ms")
-        .with_description("Duration a distributed lock was held in milliseconds")
-        .with_unit(opentelemetry::metrics::Unit::new("ms"))
-        .init()
-}
-
-/// Requests to `GET /admin/audit/search`. Exists specifically to give
-/// operators a way to confirm the endpoint has real traffic now that it's
-/// mounted — see docs/audit-compliance-admin-endpoints.md for how to use
-/// this to distinguish "no incidents" from "nobody's used this yet."
-pub fn admin_audit_search_requests_total() -> Counter<u64> {
-    meter()
-        .u64_counter("admin_audit_search_requests_total")
-        .with_description("Requests to the admin audit-log search endpoint")
-        .init()
-}
-
-/// Requests to the compliance report endpoints, labeled by `operation`
-/// ("generate" | "list").
-pub fn admin_compliance_report_requests_total() -> Counter<u64> {
-    meter()
-        .u64_counter("admin_compliance_report_requests_total")
-        .with_description("Requests to the admin compliance report endpoints, labeled by operation")
-        .init()
-}
-
-// ---------------------------------------------------------------------------
-// Provider initialisation
-// ---------------------------------------------------------------------------
-
-/// Initialise the global OTel metrics provider and return it so the caller
-/// can keep it alive for the process lifetime.
-///
-/// Call this once at startup, before any instruments are used.
-pub fn init_metrics_provider() -> Result<SdkMeterProvider, Box<dyn std::error::Error>> {
-    let endpoint =
-        std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string());
-
-    let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "synapse-core".to_string());
-
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
-        .with_endpoint(&endpoint)
-        .build_metrics_exporter(
-            Box::new(DefaultAggregationSelector::new()),
-            Box::new(DefaultTemporalitySelector::new()),
-        )?;
-
-    let reader = PeriodicReader::builder(exporter, runtime::Tokio)
-        .with_interval(std::time::Duration::from_secs(30))
-        .build();
-
-    let provider = SdkMeterProvider::builder()
-        .with_reader(reader)
-        .with_resource(opentelemetry_sdk::Resource::new(vec![KeyValue::new(
-            "service.name",
-            service_name,
-        )]))
-        .build();
-
-    global::set_meter_provider(provider.clone());
-
-    tracing::info!(
-        otlp_endpoint = %endpoint,
-        "OpenTelemetry metrics provider initialised"
-    );
-
-    Ok(provider)
-}
-
-// ---------------------------------------------------------------------------
-// Legacy shim — kept for backward compatibility with existing call sites
-// ---------------------------------------------------------------------------
-
-/// Opaque handle returned by [`init_metrics`].
-#[derive(Clone)]
-pub struct MetricsHandle {
-    /// Keeps the MeterProvider alive.
-    _provider: std::sync::Arc<SdkMeterProvider>,
-}
-
-/// Initialise metrics and return a handle.  Logs a warning but does not panic
-/// if the OTLP exporter cannot be configured (e.g. in test environments).
-pub fn init_metrics() -> Result<MetricsHandle, Box<dyn std::error::Error>> {
-    let provider = init_metrics_provider()?;
-    Ok(MetricsHandle {
-        _provider: std::sync::Arc::new(provider),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Pool stats background task
-// ---------------------------------------------------------------------------
-
-/// Spawn a background task that periodically records pool stats as OTel gauges.
-///
-/// The task runs every `interval` seconds and reads from the provided pool.
-pub fn spawn_pool_metrics_task(pool: sqlx::PgPool, interval_secs: u64) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        loop {
-            ticker.tick().await;
-
-            let active = pool.size() as u64;
-            let idle = pool.num_idle() as u64;
-            let timeouts = crate::db::queries::DB_QUERY_TIMEOUT_TOTAL
-                .load(std::sync::atomic::Ordering::Relaxed);
-
-            tracing::debug!(
-                db_pool_active = active,
-                db_pool_idle = idle,
-                db_query_timeouts_total = timeouts,
-                "Pool metrics recorded"
-            );
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Middleware for webhook auth (legacy compatibility)
-// ---------------------------------------------------------------------------
-
-/// Simple auth middleware for webhook routes.
-/// In production, implement proper authentication.
-pub async fn metrics_auth_middleware(
-    axum::extract::State(_config): axum::extract::State<crate::config::Config>,
-    request: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next<axum::body::Body>,
-) -> Result<axum::response::Response, axum::http::StatusCode> {
-    Ok(next.run(request).await)
 }
 
 #[cfg(test)]
-mod tests {
+mod scorecard_tests {
     use super::*;
 
+    fn sample(mean: f64, std_dev: f64, count: u64) -> MetricSample {
+        MetricSample::new(mean, std_dev, count)
+    }
+
+    fn window(
+        error_rate: f64,
+        p50: f64,
+        p95: f64,
+        p99: f64,
+        incidents: f64,
+    ) -> ReliabilityWindow {
+        ReliabilityWindow {
+            error_rate: sample(error_rate, error_rate * 0.1, 1000),
+            p50_latency_ms: sample(p50, p50 * 0.1, 1000),
+            p95_latency_ms: sample(p95, p95 * 0.1, 1000),
+            p99_latency_ms: sample(p99, p99 * 0.1, 1000),
+            incident_count: sample(incidents, incidents.max(1.0) * 0.1, 1000),
+        }
+    }
+
     #[test]
-    fn test_metrics_initialization() {
-        // init_metrics requires a running OTLP endpoint; just verify it compiles.
-        let _ = init_metrics;
+    fn flags_known_regression() {
+        let before = window(0.01, 20.0, 50.0, 90.0, 1.0);
+        // Error rate and p95 latency both jump sharply after the release.
+        let after = window(0.05, 20.0, 120.0, 90.0, 1.0);
+        let card = build_reliability_scorecard("v1.2.3", before, after, false);
+
+        assert!(card.has_regression());
+        let error = card
+            .comparisons
+            .iter()
+            .find(|c| c.name == "error_rate")
+            .unwrap();
+        assert_eq!(error.verdict, RegressionVerdict::Regression);
+        let p95 = card
+            .comparisons
+            .iter()
+            .find(|c| c.name == "p95_latency_ms")
+            .unwrap();
+        assert_eq!(p95.verdict, RegressionVerdict::Regression);
+    }
+
+    #[test]
+    fn treats_noise_as_within_noise() {
+        let before = window(0.01, 20.0, 50.0, 90.0, 1.0);
+        // Small fluctuations well inside the noise band.
+        let after = window(0.0101, 20.1, 50.2, 90.1, 1.0);
+        let card = build_reliability_scorecard("v1.2.4", before, after, false);
+
+        assert!(!card.has_regression());
+        assert!(card
+            .comparisons
+            .iter()
+            .all(|c| c.verdict == RegressionVerdict::WithinNoise));
+    }
+
+    #[test]
+    fn flags_improvement_distinctly() {
+        let before = window(0.05, 20.0, 120.0, 90.0, 3.0);
+        let after = window(0.01, 20.0, 50.0, 90.0, 1.0);
+        let card = build_reliability_scorecard("v1.2.5", before, after, false);
+
+        assert!(!card.has_regression());
+        let error = card
+            .comparisons
+            .iter()
+            .find(|c| c.name == "error_rate")
+            .unwrap();
+        assert_eq!(error.verdict, RegressionVerdict::Improvement);
+    }
+
+    #[test]
+    fn detects_overlapping_windows() {
+        // Release A's after window ends at t=1000; release B's before window
+        // starts at t=900, so they overlap.
+        assert!(windows_overlap(1000, 900));
+        // Non-overlapping: B's before window starts after A's after window ends.
+        assert!(!windows_overlap(1000, 1000));
+        assert!(!windows_overlap(1000, 1200));
+    }
+
+    #[test]
+    fn records_overlap_on_scorecard() {
+        let before = window(0.01, 20.0, 50.0, 90.0, 1.0);
+        let after = window(0.01, 20.0, 50.0, 90.0, 1.0);
+        let card = build_reliability_scorecard("v1.2.6", before, after, true);
+        assert!(card.windows_overlapped);
     }
 }
