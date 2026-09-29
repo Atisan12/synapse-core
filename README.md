@@ -202,6 +202,8 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 ## Handsoff notes
 
+<!-- handsoff-issue-1345 -->
+- #1345: [High] Add SDK request/response logging with secret redaction
 <!-- handsoff-issue-1341 -->
 - #1341: [High] Build a Go SDK with parity to the Rust SDK
 <!-- handsoff-issue-1351 -->
